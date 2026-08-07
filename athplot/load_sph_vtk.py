@@ -25,9 +25,16 @@ class SphericalData:
   """
     This class represents a VTK spherical data dump from AthenaK.
 
+    Since AthenaK PR #772, a single sph output block can hold multiple radii
+    (<output*>/radii = ...), in which case the file contains all of them
+    stacked together (one combined file per variable per dump, instead of one
+    file per radius). Pass `radius=<value>` (nearest match) or
+    `radius_index=<int>` to select which radius' data to load; both are
+    ignored (no selection needed) for a single-radius file.
+
     Note that this utility relies on the VTK python package.
   """
-  def __init__(self, filename, encoding='latin_1'):
+  def __init__(self, filename, encoding='latin_1', radius=None, radius_index=None):
     # Extract metadata stored as a comment in the second line
     string = ""
     with open(filename, 'r', encoding=encoding) as f:
@@ -60,23 +67,45 @@ class SphericalData:
 
     reader.update()
 
-    # Read in the coordinate data
+    # Reorganize the data into separate r, theta, and phi quantities.
+    # DIMENSIONS is (nradii, ntheta, 2*ntheta): radius is the fastest-varying
+    # point/scalar index, so the flat layout is angle-major, radius-minor
+    # (flat index = angle_index * nradii + radius_index).
+    dims = [0, 0, 0]
+    reader.GetOutput().GetDimensions(dims)
+    self.nradii = dims[0]
+    self.shape = (dims[2], dims[1])
+
+    # Radii present in the file, written explicitly as FieldData (in the same
+    # order as the radius-minor index above). Older single-radius files that
+    # predate PR #772 won't have this array.
+    radii_vtk = reader.GetOutput().GetFieldData().GetArray('RADII')
+    self.radii = numpy_support.vtk_to_numpy(radii_vtk) if radii_vtk is not None else None
+
+    if self.nradii == 1:
+      ridx = 0
+    elif radius_index is not None:
+      ridx = radius_index
+    elif radius is not None:
+      if self.radii is None:
+        raise RuntimeError(f"{filename}: cannot select radius={radius}: no RADII "
+                            "field data found in file")
+      ridx = int(np.argmin(np.abs(self.radii - radius)))
+    else:
+      raise RuntimeError(f"{filename}: contains {self.nradii} radii; pass "
+                          "radius=<value> or radius_index=<int> to select one")
+
     cells_vtk = reader.GetOutput().GetPoints().GetData()
     cells = numpy_support.vtk_to_numpy(cells_vtk)
 
-    # Reorganize the data into separate r, theta, and phi quantities
-    dims = [0, 0, 0]
-    reader.GetOutput().GetDimensions(dims)
-    if dims[0] != 1:
-      raise RuntimeError('More than one radial point detected.')
-    self.shape = (dims[2], dims[1])
+    self.r = self.radii[ridx] if self.radii is not None else cells[ridx, 0]
 
-    self.r = cells[0,0]
+    sel = slice(ridx, None, self.nradii)
 
-    self.theta = cells[:,1]
+    self.theta = cells[sel, 1]
     self.theta = np.reshape(self.theta, self.shape)
 
-    self.phi = cells[:,2]
+    self.phi = cells[sel, 2]
     self.phi = np.reshape(self.phi, self.shape)
 
     # Read in the field data
@@ -88,8 +117,8 @@ class SphericalData:
       field = reader.GetOutput().GetPointData().GetArrayName(i)
       self.field_names.append(field)
       field_data = reader.GetOutput().GetPointData().GetArray(i)
-      self.fields[field] = numpy_support.vtk_to_numpy(field_data)
-      self.fields[field] = np.reshape(self.fields[field], self.shape)
+      full = numpy_support.vtk_to_numpy(field_data)
+      self.fields[field] = np.reshape(full[sel], self.shape)
 
   def plot_data(self, var, ax, cmap='viridis', norm=None, vmin=None, vmax=None):
     # Note that phi is periodic, so for plotting purposes we need to append an extra
